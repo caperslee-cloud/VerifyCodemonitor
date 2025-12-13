@@ -386,8 +386,9 @@ class EmailMonitor:
                 if isinstance(match, tuple):
                     match = match[0]
                 if match.isdigit() and 4 <= len(match) <= 8:
+                      logger.debug(f"【DEBUG】正则匹配命中: 模式 '{pattern}' -> 提取内容 '{match}'")  # <-- 新增此行
                     return match
-        
+      
         return None
     
     def connect_imap(self) -> Optional[imaplib.IMAP4_SSL]:
@@ -466,7 +467,10 @@ class EmailMonitor:
                         body = payload.decode('utf-8', errors='ignore')
                 except:
                     body = str(msg.get_payload())
-            
+            # ...（上面是获取body的代码）
+            # 提取验证码
+            logger.debug(f"【DEBUG】解析到的邮件正文 (前300字符): {repr(body[:300])}")  # <-- 新增此行
+
             # 提取验证码
             code = self.extract_verification_code(body)
             
