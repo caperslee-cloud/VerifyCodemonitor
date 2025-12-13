@@ -110,11 +110,11 @@ class ColoredFormatter(logging.Formatter):
 def setup_logging():
     """配置日志系统"""
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     
     # 控制台处理器
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)
     
     # 文件处理器（可选）
     if os.path.exists("/tmp"):
