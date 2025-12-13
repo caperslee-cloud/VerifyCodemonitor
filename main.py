@@ -48,25 +48,25 @@ class Config:
     MAX_ERROR_COUNT = 5
     ERROR_BACKOFF = 60  # 连续错误后等待时间（秒）
     
-   # 验证码模式 (优化版：更精准，优先级更高)
+    # 验证码模式 (最终通用增强版 - 针对HTML邮件优化)
     CODE_PATTERNS = [
-        # 规则1-3：最高优先级，明确包含“验证码”标签
-        r'验证码[：:]\s*(\d{4,8})',
-        r'[Cc]ode[：:]\s*(\d{4,8})',
-        r'【.*?】\s*(\d{4,8})',
+        # ==== 针对中文HTML邮件的精准规则 ====
+        # 规则1: 精确匹配"验证码"段落后的那个大号数字div
+        r'(?:验证码</p>\s*<div[^>]*>\s*)(\d{6})(?=\s*</div>)',
         
-        # 规则4：高优先级，匹配独立行中的4-8位数字（很可能是验证码）
+        # 规则2: 匹配"验证码"文本附近、被特定样式包裹的6位数字
+        r'验证码[^<]*</p>\s*<div[^>]*style\s*=[^>]*font-size\s*:\s*\d+px[^>]*>\s*(\d{6})\s*</div>',
+        
+        # ==== 通用中英文规则 ====
+        # 规则3: 匹配"验证码/Code"标签后的数字
+        r'(?:验证码|验证代码|Code|CODE)[：:\s]*(\d{4,8})',
+        
+        # 规则4: 匹配独立一行中的4-8位数字
         r'^\s*(\d{4,8})\s*$',
         
-        # 规则5：中优先级，在“验证码”一词附近查找6位数字
-        r'(?<=验证码)[^0-9]{0,20}?(\d{6})',
-        r'(?<=[Cc]ode)[^0-9]{0,20}?(\d{6})',
-        
-        # 规则6：低优先级，通用的独立6位数字（放在最后）
-        r'(?<!\d)(\d{6})(?!\d)',
-        
-        # 规则7：最低优先级，通用的独立4位数字（风险高，放最后）
-        # r'\b(\d{4})\b',  # <-- 暂时注释掉这条容易误匹配卡号的规则
+        # ==== 保底规则 (经过严格限制) ====
+        # 规则5: 独立的6位数字，但排除明显是颜色代码、尺寸等的数字
+        r'(?<![#\-\.\d])(\d{6})(?![#\-\.\d%px])',
     ]
     
     @classmethod
@@ -383,6 +383,35 @@ class EmailMonitor:
         except Exception:
             return str(header)
     
+    def _clean_html_text(self, text: str) -> str:
+        """清理HTML标签和样式，防止误匹配"""
+        if not text:
+            return ""
+        
+        # 移除HTML标签
+        cleaned = re.sub(r'<[^>]+>', ' ', text)
+        
+        # 专门移除颜色代码
+        cleaned = re.sub(r'#\d{3,6}', ' ', cleaned)  # 移除 #333, #333333 等颜色代码
+        cleaned = re.sub(r'rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+', ' ', cleaned)  # 移除 rgb(), rgba()
+        
+        # 移除常见CSS属性
+        cleaned = re.sub(r'\b(margin|padding|width|height|color|font-size)[: ]*\d+', ' ', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\d+px', ' ', cleaned, flags=re.IGNORECASE)
+        
+        # 移除HTML数字实体
+        cleaned = re.sub(r'&#\d+;', ' ', cleaned)
+        
+        # 移除银行卡号等常见带分隔符的数字串
+        cleaned = re.sub(r'\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b', ' ', cleaned)  # 完整卡号
+        cleaned = re.sub(r'\b\d{4}[- ]\d{4}[- ]\d{4}\b', ' ', cleaned)           # 部分卡号
+        cleaned = re.sub(r'\b\d{4}[- ]\d{4}\b', ' ', cleaned)                    # 短格式卡号片段
+        
+        # 合并多余空格
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        
+        return cleaned.strip()
+    
     def extract_verification_code(self, text: str) -> Optional[str]:
         """提取验证码"""
         if not text:
@@ -391,32 +420,30 @@ class EmailMonitor:
         # 截取前1000字符以提高效率
         search_text = text[:1000]
         
-        # +++ 新增：清理HTML标签和CSS属性，防止误匹配 +++
-        # 移除HTML标签及其属性内容
-        import re
-        search_text = re.sub(r'<[^>]+>', ' ', search_text)  # 移除所有HTML标签
-        search_text = re.sub(r'\b(margin|padding|width|height|size)[: ]*\d+', ' ', search_text, flags=re.IGNORECASE)  # 移除常见CSS属性
-        search_text = re.sub(r'\d+px', ' ', search_text, flags=re.IGNORECASE)  # 移除带px单位的数字
-        search_text = re.sub(r'&#\d+;', ' ', search_text)  # 移除HTML数字实体（如 '）
-        search_text = re.sub(r'\s+', ' ', search_text)  # 将多个空格合并为一个
-        # ... 您已有的清理代码 ...
-
-        # +++ 新增：移除银行卡号等常见带分隔符的数字串 +++
-        search_text = re.sub(r'\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b', ' ', search_text)  # 移除完整卡号
-        search_text = re.sub(r'\b\d{4}[- ]\d{4}[- ]\d{4}\b', ' ', search_text)           # 移除部分卡号
-        search_text = re.sub(r'\b\d{4}[- ]\d{4}\b', ' ', search_text)                    # 移除短格式卡号片段
+        logger.debug(f"【DEBUG】原始文本 (前200字符): {repr(search_text[:200])}")
         
-        logger.debug(f"【DEBUG】清理后的文本: {repr(search_text[:200])}")  # 可选：查看清理效果
+        # 对文本进行清理
+        cleaned_text = self._clean_html_text(search_text)
+        logger.debug(f"【DEBUG】清理后的文本: {repr(cleaned_text[:200])}")
         
-        for pattern in Config.CODE_PATTERNS:
-            matches = re.findall(pattern, search_text, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    match = match[0]
-                if match.isdigit() and 4 <= len(match) <= 8:
-                    logger.debug(f"【DEBUG】正则匹配命中: 模式 '{pattern}' -> 提取内容 '{match}'")  # <-- 新增此行
-                    return match
-      
+        # 首先在原始HTML中尝试高精度匹配
+        for pattern in Config.CODE_PATTERNS[:2]:  # 只使用前两个高精度规则
+            match = re.search(pattern, search_text, re.IGNORECASE)
+            if match:
+                code = match.group(1)
+                if code.isdigit() and 4 <= len(code) <= 8:
+                    logger.debug(f"【DEBUG】高精度匹配命中: 模式 '{pattern}' -> 提取内容 '{code}'")
+                    return code
+        
+        # 如果在原始HTML中没匹配到，尝试在清理后的文本中匹配通用规则
+        for pattern in Config.CODE_PATTERNS[2:]:  # 使用剩余的通用规则
+            match = re.search(pattern, cleaned_text, re.IGNORECASE)
+            if match:
+                code = match.group(1)
+                if code.isdigit() and 4 <= len(code) <= 8:
+                    logger.debug(f"【DEBUG】通用规则匹配命中: 模式 '{pattern}' -> 提取内容 '{code}'")
+                    return code
+        
         return None
     
     def connect_imap(self) -> Optional[imaplib.IMAP4_SSL]:
@@ -495,10 +522,9 @@ class EmailMonitor:
                         body = payload.decode('utf-8', errors='ignore')
                 except:
                     body = str(msg.get_payload())
-            # ...（上面是获取body的代码）
-            # 提取验证码
-            logger.debug(f"【DEBUG】解析到的邮件正文 (前300字符): {repr(body[:300])}")  # <-- 新增此行
-
+            
+            logger.debug(f"【DEBUG】解析到的邮件正文 (前300字符): {repr(body[:300])}")
+            
             # 提取验证码
             code = self.extract_verification_code(body)
             
@@ -652,10 +678,10 @@ def banner():
     """显示启动横幅"""
     print("\n" + "=" * 60)
     print("QQ企业邮箱 → Telegram 验证码转发服务")
-    print("版本: 1.2.0 | 专为 Koyeb 部署优化")
+    print("版本: 1.3.0 | 专为 Koyeb 部署优化")
     print("=" * 60)
     print("功能特性:")
-    print("  ✓ 精准验证码识别（6种匹配模式）")
+    print("  ✓ 精准验证码识别（支持中英文HTML邮件）")
     print("  ✓ 双重防休眠机制（内部+外部）")
     print("  ✓ 完整健康检查接口（GET/HEAD/POST）")
     print("  ✓ 实时监控指标和错误统计")
@@ -673,16 +699,16 @@ def main():
     
     logger.info("✅ 所有配置验证通过")
     
-    # 2. 启动健康检查服务器（后台线程）
+    # 2. 启动健康检查服务器（背景线程）
     health_thread = threading.Thread(
         target=run_health_server,
         name="HealthServer",
         daemon=True
     )
     health_thread.start()
-    time.sleep(1)  # 给服务器启动时间
+    time.sleep(1)
     
-    # 3. 启动自我唤醒系统（后台线程）
+    # 3. 启动自我唤醒系统（背景线程）
     try:
         waker = SelfWaker()
         wake_thread = threading.Thread(
