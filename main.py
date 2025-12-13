@@ -48,14 +48,25 @@ class Config:
     MAX_ERROR_COUNT = 5
     ERROR_BACKOFF = 60  # 连续错误后等待时间（秒）
     
-    # 验证码模式
+   # 验证码模式 (优化版：更精准，优先级更高)
     CODE_PATTERNS = [
+        # 规则1-3：最高优先级，明确包含“验证码”标签
         r'验证码[：:]\s*(\d{4,8})',
-        r'code[：:]\s*(\d{4,8})',
-        r'Code[：:]\s*(\d{4,8})',
+        r'[Cc]ode[：:]\s*(\d{4,8})',
         r'【.*?】\s*(\d{4,8})',
-        r'(?<!\d)(\d{6})(?!\d)',  # 独立6位数字
-        r'\b(\d{4})\b',           # 独立4位数字
+        
+        # 规则4：高优先级，匹配独立行中的4-8位数字（很可能是验证码）
+        r'^\s*(\d{4,8})\s*$',
+        
+        # 规则5：中优先级，在“验证码”一词附近查找6位数字
+        r'(?<=验证码)[^0-9]{0,20}?(\d{6})',
+        r'(?<=[Cc]ode)[^0-9]{0,20}?(\d{6})',
+        
+        # 规则6：低优先级，通用的独立6位数字（放在最后）
+        r'(?<!\d)(\d{6})(?!\d)',
+        
+        # 规则7：最低优先级，通用的独立4位数字（风险高，放最后）
+        # r'\b(\d{4})\b',  # <-- 暂时注释掉这条容易误匹配卡号的规则
     ]
     
     @classmethod
@@ -388,6 +399,12 @@ class EmailMonitor:
         search_text = re.sub(r'\d+px', ' ', search_text, flags=re.IGNORECASE)  # 移除带px单位的数字
         search_text = re.sub(r'&#\d+;', ' ', search_text)  # 移除HTML数字实体（如 '）
         search_text = re.sub(r'\s+', ' ', search_text)  # 将多个空格合并为一个
+        # ... 您已有的清理代码 ...
+
+        # +++ 新增：移除银行卡号等常见带分隔符的数字串 +++
+        search_text = re.sub(r'\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b', ' ', search_text)  # 移除完整卡号
+        search_text = re.sub(r'\b\d{4}[- ]\d{4}[- ]\d{4}\b', ' ', search_text)           # 移除部分卡号
+        search_text = re.sub(r'\b\d{4}[- ]\d{4}\b', ' ', search_text)                    # 移除短格式卡号片段
         
         logger.debug(f"【DEBUG】清理后的文本: {repr(search_text[:200])}")  # 可选：查看清理效果
         
