@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-QQ企业邮箱 → Telegram 验证码转发 (最终稳定版)
-功能：1.精准识别中英文验证码邮件 2.完整显示原邮件标题 3.简洁消息格式 4.健康检查防休眠
+QQ企业邮箱 → Telegram 验证码转发 (专业生产版)
+功能：1.精准验证码识别 2.双重防休眠机制 3.完整监控指标 4.优雅错误处理
+部署于Koyeb时，配置环境变量即可使用
 """
 
 import os
+import sys
 import time
 import imaplib
 import email
@@ -12,403 +14,496 @@ import re
 import requests
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import random
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Tuple
+from dataclasses import dataclass
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from email.header import decode_header
-from datetime import datetime
+from email.utils import parsedate_to_datetime
 import pytz
+from enum import Enum
+import ssl
 
-# ========== 配置说明（在Koyeb环境变量中设置）==========
-# 必需：
-# 1. EMAIL: 你的完整企业邮箱地址
-# 2. PASSWORD: 企业邮箱的客户端专用密码
-# 3. BOT_TOKEN: 你的Telegram Bot Token
-# 4. CHAT_ID: 你的Telegram Chat ID（支持多个，用逗号分隔）
-# ==================================================
-
-# 设置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-# ========== 1. 时区设置 ==========
-BEIJING_TZ = pytz.timezone('Asia/Shanghai')
-
-def get_beijing_time():
-    """获取当前北京时间（完整格式）"""
-    now_utc = datetime.utcnow()
-    now_beijing = pytz.utc.localize(now_utc).astimezone(BEIJING_TZ)
-    return now_beijing.strftime('%Y-%m-%d %H:%M:%S')
-
-def get_beijing_time_short():
-    """获取当前北京时间（仅时间）"""
-    now_utc = datetime.utcnow()
-    now_beijing = pytz.utc.localize(now_utc).astimezone(BEIJING_TZ)
-    return now_beijing.strftime('%H:%M:%S')
-
-def parse_email_time(email_time_str):
-    """解析邮件头时间并转换为北京时间（仅时间部分）"""
-    if not email_time_str:
-        return get_beijing_time_short()
-    try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(email_time_str)
-        if dt.tzinfo is None:
-            dt = pytz.utc.localize(dt)
-        beijing_time = dt.astimezone(BEIJING_TZ)
-        return beijing_time.strftime('%H:%M:%S')
-    except Exception:
-        return get_beijing_time_short()
-
-# ========== 2. 健康检查服务器（防休眠）==========
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        response = f"服务运行正常 | 北京时间: {get_beijing_time()}"
-        self.wfile.write(response.encode())
+# ==================== 配置常量 ====================
+class Config:
+    """配置管理类"""
+    # IMAP 设置
+    IMAP_SERVER = "imap.exmail.qq.com"
+    IMAP_PORT = 993
+    IMAP_TIMEOUT = 15
+    IMAP_SSL = True
     
-    def log_message(self, format, *args):
-        pass
+    # 健康检查
+    HEALTH_PORT = 8000
+    HEALTH_HOST = "0.0.0.0"
+    
+    # 时间设置
+    BEIJING_TZ = pytz.timezone("Asia/Shanghai")
+    CHECK_INTERVAL = 15  # 邮件检查间隔（秒）
+    SELF_PING_INTERVAL = 280  # 自我唤醒间隔（秒），略小于5分钟
+    
+    # 监控设置
+    MAX_ERROR_COUNT = 5
+    ERROR_BACKOFF = 60  # 连续错误后等待时间（秒）
+    
+    # 验证码模式
+    CODE_PATTERNS = [
+        r'验证码[：:]\s*(\d{4,8})',
+        r'code[：:]\s*(\d{4,8})',
+        r'Code[：:]\s*(\d{4,8})',
+        r'【.*?】\s*(\d{4,8})',
+        r'(?<!\d)(\d{6})(?!\d)',  # 独立6位数字
+        r'\b(\d{4})\b',           # 独立4位数字
+    ]
+    
+    @classmethod
+    def get_env(cls, key: str, default: str = "") -> str:
+        """获取环境变量"""
+        return os.environ.get(key, default).strip()
+    
+    @classmethod
+    def validate_config(cls) -> bool:
+        """验证必要配置"""
+        required = ["EMAIL", "PASSWORD", "BOT_TOKEN", "CHAT_ID"]
+        missing = [key for key in required if not cls.get_env(key)]
+        
+        if missing:
+            logging.error(f"❌ 缺失必要环境变量: {', '.join(missing)}")
+            logging.error("请在Koyeb环境变量中设置:")
+            logging.error("  - EMAIL: 你的完整企业邮箱地址")
+            logging.error("  - PASSWORD: 邮箱客户端专用密码")
+            logging.error("  - BOT_TOKEN: Telegram Bot Token")
+            logging.error("  - CHAT_ID: Telegram Chat ID（多个用逗号分隔）")
+            return False
+        
+        # 验证邮箱格式
+        email_val = cls.get_env("EMAIL")
+        if "@" not in email_val or "." not in email_val.split("@")[-1]:
+            logging.warning(f"⚠️  邮箱地址格式可能不正确: {email_val}")
+        
+        return True
 
-def health_server():
-    """启动健康检查服务器（端口8000）"""
-    server = HTTPServer(('0.0.0.0', 8000), HealthHandler)
-    logger.info(f"✅ 健康检查服务器已启动 | {get_beijing_time()}")
-    server.serve_forever()
+# ==================== 日志配置 ====================
+class ColoredFormatter(logging.Formatter):
+    """彩色日志格式化器"""
+    COLORS = {
+        'DEBUG': '\033[36m',     # 青色
+        'INFO': '\033[32m',      # 绿色
+        'WARNING': '\033[33m',   # 黄色
+        'ERROR': '\033[31m',     # 红色
+        'CRITICAL': '\033[41m',  # 红底白字
+        'RESET': '\033[0m'
+    }
+    
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
+        reset_color = self.COLORS['RESET']
+        
+        # 添加颜色
+        record.levelname = f"{log_color}{record.levelname}{reset_color}"
+        record.msg = f"{log_color}{record.msg}{reset_color}"
+        
+        return super().format(record)
 
-# ========== 3. 邮箱监控核心 ==========
+def setup_logging():
+    """配置日志系统"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # 文件处理器（可选）
+    if os.path.exists("/tmp"):
+        file_handler = logging.FileHandler("/tmp/email_monitor.log")
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(
+            '[%(asctime)s] %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+    
+    # 控制台格式化
+    console_formatter = ColoredFormatter(
+        '[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# ==================== 数据模型 ====================
+@dataclass
+class EmailInfo:
+    """邮件信息"""
+    subject: str
+    sender: str
+    date: str
+    code: Optional[str] = None
+    raw_body: str = ""
+
+@dataclass
+class HealthMetrics:
+    """健康指标"""
+    start_time: float
+    email_checks: int = 0
+    emails_forwarded: int = 0
+    telegram_sent: int = 0
+    errors: int = 0
+    last_email_check: Optional[float] = None
+    last_telegram_send: Optional[float] = None
+    
+    def to_dict(self) -> Dict:
+        """转换为字典"""
+        uptime = int(time.time() - self.start_time)
+        
+        return {
+            "status": "healthy",
+            "service": "qq_email_monitor",
+            "uptime_seconds": uptime,
+            "uptime_human": str(timedelta(seconds=uptime)),
+            "email_checks": self.email_checks,
+            "emails_forwarded": self.emails_forwarded,
+            "telegram_sent": self.telegram_sent,
+            "error_count": self.errors,
+            "last_email_check": self.format_time(self.last_email_check),
+            "last_telegram_send": self.format_time(self.last_telegram_send),
+            "current_time": self.get_beijing_time(),
+            "version": "1.2.0"
+        }
+    
+    @staticmethod
+    def format_time(timestamp: Optional[float]) -> str:
+        """格式化时间戳"""
+        if not timestamp:
+            return "从未"
+        dt = datetime.fromtimestamp(timestamp, tz=Config.BEIJING_TZ)
+        return dt.strftime('%H:%M:%S')
+    
+    @staticmethod
+    def get_beijing_time() -> str:
+        """获取北京时间"""
+        now = datetime.now(Config.BEIJING_TZ)
+        return now.strftime('%Y-%m-%d %H:%M:%S')
+
+# ==================== 健康检查服务器 ====================
+class EnhancedHealthHandler(BaseHTTPRequestHandler):
+    """增强型健康检查处理器"""
+    
+    server_version = "EmailMonitor/1.2"
+    metrics = HealthMetrics(start_time=time.time())
+    
+    def log_message(self, format: str, *args):
+        """自定义日志格式"""
+        client_ip = self.client_address[0]
+        request_line = args[0] if args else ""
+        
+        # 忽略自我唤醒的日志
+        if client_ip in ["127.0.0.1", "::1"] and "HEAD" in request_line:
+            return
+        
+        logger.info(f"🌐 健康检查 - {client_ip} - {request_line}")
+    
+    def do_GET(self):
+        """处理GET请求"""
+        self.metrics.last_email_check = time.time()
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        self.end_headers()
+        
+        response = self.metrics.to_dict()
+        self.wfile.write(json.dumps(response, indent=2, ensure_ascii=False).encode('utf-8'))
+    
+    def do_HEAD(self):
+        """处理HEAD请求（UptimeRobot等监控服务使用）"""
+        self.metrics.last_email_check = time.time()
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        self.end_headers()
+    
+    def do_POST(self):
+        """处理POST请求（可用于手动触发检查）"""
+        if self.path == "/check-now":
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            response = {
+                "status": "triggered",
+                "message": "邮件检查已手动触发",
+                "timestamp": HealthMetrics.get_beijing_time()
+            }
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_health_server():
+    """运行健康检查服务器"""
+    server_address = (Config.HEALTH_HOST, Config.HEALTH_PORT)
+    
+    try:
+        httpd = HTTPServer(server_address, EnhancedHealthHandler)
+        logger.info(f"🛡️  健康服务器启动 | 地址: http://{Config.HEALTH_HOST}:{Config.HEALTH_PORT}")
+        httpd.serve_forever()
+    except Exception as e:
+        logger.error(f"❌ 健康服务器启动失败: {e}")
+        sys.exit(1)
+
+# ==================== 自我唤醒系统 ====================
+class SelfWaker:
+    """自我唤醒系统"""
+    
+    def __init__(self, service_url: str = None):
+        self.service_url = service_url or f"http://localhost:{Config.HEALTH_PORT}"
+        self.interval = Config.SELF_PING_INTERVAL
+        
+        # 从环境变量读取间隔
+        env_interval = Config.get_env("SELF_PING_INTERVAL")
+        if env_interval and env_interval.isdigit():
+            self.interval = int(env_interval)
+            logger.info(f"🔧 使用自定义唤醒间隔: {self.interval}秒")
+    
+    def ping(self) -> bool:
+        """执行自我唤醒"""
+        try:
+            # 添加随机抖动避免固定间隔
+            jitter = random.randint(-5, 5)
+            time.sleep(max(0, jitter))
+            
+            response = requests.head(
+                self.service_url,
+                timeout=10,
+                headers={'User-Agent': 'SelfWaker/1.0'}
+            )
+            
+            if response.status_code == 200:
+                logger.debug(f"🔄 自我唤醒成功")
+                return True
+            else:
+                logger.warning(f"⚠️ 唤醒响应异常: {response.status_code}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ 自我唤醒失败: {e}")
+            return False
+    
+    def run(self):
+        """运行唤醒循环"""
+        logger.info(f"🚀 自我唤醒系统启动 | 间隔: {self.interval}秒")
+        
+        cycle = 0
+        consecutive_failures = 0
+        
+        while True:
+            try:
+                cycle += 1
+                time.sleep(self.interval)
+                
+                success = self.ping()
+                
+                if success:
+                    consecutive_failures = 0
+                    if cycle % 12 == 0:  # 每小时报告一次
+                        logger.info(f"✅ 自我唤醒运行正常 | 已执行 {cycle} 次")
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        logger.error(f"🚨 连续唤醒失败 {consecutive_failures} 次")
+                
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logger.error(f"唤醒循环异常: {e}")
+                time.sleep(60)
+
+# ==================== 邮箱监控核心 ====================
 class EmailMonitor:
+    """邮箱监控器"""
+    
     def __init__(self):
-        # 固定配置：QQ企业邮箱服务器
-        self.imap_server = "imap.exmail.qq.com"
-        self.imap_port = 993
+        self.email = Config.get_env("EMAIL")
+        self.password = Config.get_env("PASSWORD")
+        self.bot_token = Config.get_env("BOT_TOKEN")
+        self.chat_ids = [cid.strip() for cid in Config.get_env("CHAT_ID").split(",") if cid.strip()]
         
-        # 从环境变量读取账号信息
-        self.email = os.environ.get("EMAIL", "").strip()
-        self.password = os.environ.get("PASSWORD", "").strip()
-        self.bot_token = os.environ.get("BOT_TOKEN", "").strip()
-        self.chat_id = os.environ.get("CHAT_ID", "").strip()
-        
-        # 内置关键词库（中英文全覆盖）
-        self.keywords = [
-            # 中文关键词
-            "验证码", "校验码", "动态码", "安全码", "验证代码", 
-            "登入码", "登录码", "确认码", "激活码", "验证口令",
-            "一次性密码", "动态口令", "安全密钥", "授权码",
-            
-            # 英文关键词
-            "verification code", "verification", "email code", 
-            "security code", "login code", "access code", "one-time code",
-            "otp", "email verification", "authentication code",
-            "confirmation code", "activation code", "authorization code",
-            
-            # 通用代码关键词
-            "code", "Code", "CODE", "验证", "verify"
-        ]
-        
-        # 硬性排除关键词（绝对不转发）
-        self.hard_exclude_keywords = [
-            "日报", "周报", "月报", "财务报表", "业绩报告",
-            "会议记录", "会议通知", "会议纪要", "会议邀请",
-            "新闻稿", "通讯稿", "宣传稿", "活动通知",
-            "发票", "账单", "收据", "报价单", "合同",
-            "简历", "求职", "应聘", "招聘",
-            "订阅", "Newsletter", "newsletter",
-            "广告", "推广", "营销", "促销"
-        ]
-        
-        logger.info(f"🔍 关键词数量: {len(self.keywords)} | 排除词数量: {len(self.hard_exclude_keywords)}")
-        
-        # 检查必需配置
-        if not all([self.email, self.password, self.bot_token, self.chat_id]):
-            logger.error("❌ 错误：请设置所有必需环境变量 (EMAIL, PASSWORD, BOT_TOKEN, CHAT_ID)")
-            raise ValueError("缺少必要配置")
+        self.error_count = 0
+        self.session = requests.Session()
         
         logger.info("=" * 60)
         logger.info(f"📧 监控邮箱: {self.email}")
-        logger.info(f"🔐 服务器: {self.imap_server}")
-        logger.info(f"⏰ 系统时区: 北京时间 (UTC+8)")
-        logger.info(f"🕛 服务启动时间: {get_beijing_time()}")
+        logger.info(f"🤖 Telegram Bot: 已配置 {len(self.chat_ids)} 个接收者")
+        logger.info(f"⏰ 启动时间: {HealthMetrics.get_beijing_time()}")
         logger.info("=" * 60)
     
-    def decode_email_subject(self, subject_raw):
-        """完整解码邮件标题，保持原始格式"""
-        if not subject_raw:
+    def decode_header(self, header: str) -> str:
+        """解码邮件头"""
+        if not header:
             return "无标题"
         
         try:
-            decoded_parts = decode_header(subject_raw)
-            decoded_subject = ""
+            decoded_parts = decode_header(header)
+            result_parts = []
             
             for content, charset in decoded_parts:
                 if isinstance(content, bytes):
                     try:
-                        charset = charset if charset else 'utf-8'
-                        decoded_subject += content.decode(charset, errors='ignore')
-                    except:
-                        decoded_subject += content.decode('utf-8', errors='ignore')
+                        charset = charset or 'utf-8'
+                        result_parts.append(content.decode(charset, errors='ignore'))
+                    except (LookupError, UnicodeDecodeError):
+                        result_parts.append(content.decode('utf-8', errors='ignore'))
                 else:
-                    decoded_subject += str(content)
+                    result_parts.append(str(content))
             
-            return decoded_subject.strip()
+            return ''.join(result_parts).strip()
         except Exception:
-            return str(subject_raw).strip()
+            return str(header)
     
-    def is_hard_excluded(self, subject):
-        """检查是否为硬性排除的邮件类型"""
-        subject_lower = subject.lower()
-        for word in self.hard_exclude_keywords:
-            if word.lower() in subject_lower:
-                return True, word
-        return False, None
-    
-    def contains_keywords(self, text):
-        """检查文本是否包含任何关键词"""
-        if not text:
-            return False, None
-        
-        text_lower = text.lower()
-        for keyword in self.keywords:
-            if keyword.lower() in text_lower:
-                return True, keyword
-        return False, None
-    
-    def extract_verification_code(self, text):
-        """从文本中提取验证码（支持多种格式）"""
+    def extract_verification_code(self, text: str) -> Optional[str]:
+        """提取验证码"""
         if not text:
             return None
         
-        # 清理文本以便更好匹配
-        clean_text = text.replace(' ', '').replace('\n', '').replace('\r', '')
+        # 截取前1000字符以提高效率
+        search_text = text[:1000]
         
-        # 验证码匹配模式（按优先级排序）
-        patterns = [
-            # 标准格式：验证码：123456
-            r'验证码[：:]\s*(\d{4,8})',
-            r'校验码[：:]\s*(\d{4,8})',
-            r'动态码[：:]\s*(\d{4,8})',
-            r'安全码[：:]\s*(\d{4,8})',
-            
-            # 英文格式：code: 123456
-            r'code[：:]\s*(\d{4,8})',
-            r'Code[：:]\s*(\d{4,8})',
-            r'CODE[：:]\s*(\d{4,8})',
-            r'verification[：:]\s*(\d{4,8})',
-            r'Verification[：:]\s*(\d{4,8})',
-            
-            # 括号格式：【123456】或[123456]
-            r'[【\[\(](\d{4,8})[】\]\)]',
-            
-            # 纯数字验证码（6位最常见）
-            r'(?<!\d)(\d{6})(?!\d)',
-            r'(?<!\d)(\d{4})(?!\d)',
-            r'(?<!\d)(\d{5})(?!\d)',
-            r'(?<!\d)(\d{8})(?!\d)',
-            
-            # 带分隔符：123-456
-            r'(\d{3}[-]\d{3})',
-            r'(\d{2}[-]\d{2}[-]\d{2})',
-            
-            # 通用模式
-            r'(\d{4,8})[^\d]{0,10}有效',
-            r'(\d{4,8})[^\d]{0,10}验证',
-        ]
-        
-        # 搜索范围：正文前1000字符
-        search_text = text[:1000] + " " + clean_text[:500]
-        
-        for pattern in patterns:
-            try:
-                matches = re.findall(pattern, search_text, re.IGNORECASE)
-                for match in matches:
-                    code = match if isinstance(match, str) else match[0]
-                    
-                    # 验证码有效性检查
-                    if self.is_valid_verification_code(code):
-                        return code
-            except Exception:
-                continue
+        for pattern in Config.CODE_PATTERNS:
+            matches = re.findall(pattern, search_text, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0]
+                if match.isdigit() and 4 <= len(match) <= 8:
+                    return match
         
         return None
     
-    def is_valid_verification_code(self, code):
-        """验证是否为合理的验证码"""
-        if not code or len(code) < 4 or len(code) > 8:
-            return False
-        
-        # 排除常见无效数字
-        invalid_codes = [
-            '123456', '111111', '000000', '666666', '888888',
-            '12345678', '11111111', '00000000',
-            '1234', '1111', '0000',
-        ]
-        
-        if code in invalid_codes:
-            return False
-        
-        # 如果是纯数字，检查是否过于简单
-        if code.isdigit():
-            # 检查是否连续重复
-            if len(set(code)) == 1:
-                return False
+    def connect_imap(self) -> Optional[imaplib.IMAP4_SSL]:
+        """连接IMAP服务器"""
+        try:
+            if Config.IMAP_SSL:
+                context = ssl.create_default_context()
+                imap = imaplib.IMAP4_SSL(
+                    Config.IMAP_SERVER,
+                    Config.IMAP_PORT,
+                    timeout=Config.IMAP_TIMEOUT,
+                    ssl_context=context
+                )
+            else:
+                imap = imaplib.IMAP4(Config.IMAP_SERVER, Config.IMAP_PORT)
+                imap.starttls()
             
-            # 检查是否连续数字
-            try:
-                int_code = int(code)
-                if int_code < 1000:
-                    return False
-            except:
-                pass
-        
-        return True
-    
-    def should_process_email(self, subject, body):
-        """
-        判断是否处理邮件
-        返回: (should_process, verification_code)
-        """
-        # 1. 检查是否硬性排除
-        is_excluded, exclude_word = self.is_hard_excluded(subject)
-        if is_excluded:
-            logger.debug(f"邮件被排除: 标题含 '{exclude_word}'")
-            return False, None
-        
-        # 2. 检查是否包含关键词（标题或正文）
-        combined_text = (subject + " " + (body[:500] if body else ""))
-        has_keyword, matched_keyword = self.contains_keywords(combined_text)
-        
-        if not has_keyword:
-            logger.debug(f"邮件无关键词: {subject[:50]}...")
-            return False, None
-        
-        # 3. 提取验证码
-        verification_code = self.extract_verification_code(body if body else "")
-        
-        if verification_code:
-            logger.debug(f"找到验证码: {verification_code} | 关键词: '{matched_keyword}'")
-            return True, verification_code
-        
-        logger.debug(f"有关键词但无验证码: '{matched_keyword}'")
-        return False, None
-    
-    def get_email_connection(self):
-        """连接到QQ企业邮箱"""
-        try:
-            mail = imaplib.IMAP4_SSL(self.imap_server, self.imap_port, timeout=15)
-            mail.login(self.email, self.password)
-            mail.select("INBOX")
-            return mail
+            imap.login(self.email, self.password)
+            imap.select("INBOX")
+            
+            logger.debug("✅ IMAP连接成功")
+            return imap
+            
         except imaplib.IMAP4.error as e:
-            logger.error(f"❌ 邮箱登录失败: {e}")
-            if "Invalid credentials" in str(e):
-                logger.error("   可能原因: 1.密码错误 2.未使用客户端专用密码")
-            return None
+            logger.error(f"❌ IMAP认证失败: {e}")
+        except (TimeoutError, ConnectionError) as e:
+            logger.error(f"❌ 网络连接失败: {e}")
         except Exception as e:
-            logger.error(f"❌ 连接邮箱失败: {e}")
-            return None
+            logger.error(f"❌ 连接异常: {e}")
+        
+        return None
     
-    def fetch_email_content(self, mail, email_id):
-        """获取邮件内容"""
+    def process_email(self, imap: imaplib.IMAP4_SSL, email_id: bytes) -> Optional[EmailInfo]:
+        """处理单封邮件"""
         try:
-            status, msg_data = mail.fetch(email_id, '(RFC822)')
+            # 获取邮件
+            status, msg_data = imap.fetch(email_id, '(RFC822)')
             if status != "OK":
                 return None
             
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
+            # 解析邮件
+            msg = email.message_from_bytes(msg_data[0][1])
             
-            # 提取标题（完整原始标题）
-            subject_raw = msg.get("Subject", "")
-            subject = self.decode_email_subject(subject_raw)
+            # 提取基本信息
+            subject = self.decode_header(msg.get("Subject", ""))
+            sender = msg.get("From", "")
+            date_str = msg.get("Date", "")
             
-            # 提取邮件时间
-            email_date = msg.get("Date", "")
-            email_time = parse_email_time(email_date)
-            
-            # 提取正文（纯文本）
-            body = ""
+            # 解析日期
             try:
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        if content_type == "text/plain":
-                            try:
-                                body_bytes = part.get_payload(decode=True)
-                                if body_bytes:
-                                    body = body_bytes.decode('utf-8', errors='ignore')
-                                    break
-                            except:
-                                continue
-                else:
-                    body_bytes = msg.get_payload(decode=True)
-                    if body_bytes:
-                        body = body_bytes.decode('utf-8', errors='ignore')
-            except Exception:
-                pass
+                date_obj = parsedate_to_datetime(date_str)
+                date_beijing = date_obj.astimezone(Config.BEIJING_TZ)
+                date_formatted = date_beijing.strftime('%H:%M:%S')
+            except:
+                date_formatted = "时间解析失败"
             
-            return {
-                'id': email_id,
-                'subject': subject,
-                'body': body,
-                'time': email_time
-            }
+            # 提取正文
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition", ""))
+                    
+                    if content_type == "text/plain" and "attachment" not in content_disposition:
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body = payload.decode('utf-8', errors='ignore')
+                                break
+                        except:
+                            continue
+            else:
+                try:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode('utf-8', errors='ignore')
+                except:
+                    body = str(msg.get_payload())
+            
+            # 提取验证码
+            code = self.extract_verification_code(body)
+            
+            return EmailInfo(
+                subject=subject,
+                sender=sender,
+                date=date_formatted,
+                code=code,
+                raw_body=body[:500]  # 只保存前500字符
+            )
             
         except Exception as e:
-            logger.error(f"❌ 获取邮件内容失败: {e}")
+            logger.error(f"处理邮件异常: {e}")
             return None
     
-    def extract_validity_info(self, subject, body):
-        """提取有效期信息"""
-        if not subject and not body:
-            return None
-        
-        search_text = (subject + " " + (body[:200] if body else "")).lower()
-        
-        patterns = [
-            r'(\d+[分分钟])内有效',
-            r'有效期[为:]?(\d+[分分钟])',
-            r'有效时间[为:]?(\d+[分分钟])',
-            r'(\d+[小小时])内有效',
-            r'valid for (\d+ minutes?)',
-            r'expires in (\d+ minutes?)',
-            r'validity: (\d+ minutes?)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, search_text)
-            if match:
-                time_unit = match.group(1)
-                return f"{time_unit}内有效"
-        
-        return None
-    
-    def send_to_telegram(self, subject, verification_code, email_time, validity_info=None):
-        """发送优化格式的消息到Telegram（完整显示标题，简洁格式）"""
+    def send_to_telegram(self, email_info: EmailInfo) -> bool:
+        """发送到Telegram"""
         try:
-            # 构建简洁消息格式
-            message = "📨 验证码通知\n"
-            message += "──────────────────\n"
+            current_time = datetime.now(Config.BEIJING_TZ).strftime('%H:%M:%S')
             
-            # 完整显示原始标题
-            message += f"📌 标题：{subject}\n\n"
-            message += f"🕒 时间：{email_time}\n"
-            message += f"🔐 验证码：`{verification_code}`\n"
+            # 构建消息
+            message_lines = [
+                "📨 *验证码通知*",
+                "──────────────",
+                f"*📌 标题*: {email_info.subject}",
+                f"*👤 发件人*: {email_info.sender[:50]}",
+                f"*🕒 时间*: {email_info.date} (检测于 {current_time})",
+                "",
+                f"*🔐 验证码*: `{email_info.code}`",
+                "──────────────",
+                f"_自动转发服务 | {HealthMetrics.get_beijing_time()}_"
+            ]
             
-            # 只在有有效期信息时显示备注行
-            if validity_info:
-                message += f"📋 备注：{validity_info}\n"
+            message = "\n".join(message_lines)
             
-            message += "──────────────────"
-            
-            # 支持多个Chat ID
-            chat_ids = [cid.strip() for cid in self.chat_id.split(",") if cid.strip()]
             success_count = 0
-            
-            for chat_id in chat_ids:
+            for chat_id in self.chat_ids:
                 try:
                     url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
                     payload = {
@@ -418,163 +513,169 @@ class EmailMonitor:
                         "disable_web_page_preview": True,
                     }
                     
-                    response = requests.post(url, json=payload, timeout=10)
+                    response = self.session.post(url, json=payload, timeout=10)
+                    
                     if response.status_code == 200:
-                        logger.info(f"✅ 已发送到 Chat ID: {chat_id}")
                         success_count += 1
+                        logger.debug(f"✅ 发送到 {chat_id[:8]}... 成功")
                     else:
-                        logger.error(f"❌ 发送到 {chat_id} 失败: {response.text}")
+                        logger.error(f"❌ 发送到 {chat_id[:8]}... 失败: {response.text}")
+                        
                 except Exception as e:
-                    logger.error(f"❌ 发送到 {chat_id} 时出错: {e}")
+                    logger.error(f"发送到 {chat_id[:8]}... 异常: {e}")
             
-            logger.info(f"📤 发送完成: {success_count}/{len(chat_ids)} 成功")
+            EnhancedHealthHandler.metrics.telegram_sent += success_count
+            EnhancedHealthHandler.metrics.last_telegram_send = time.time()
+            
             return success_count > 0
-                
+            
         except Exception as e:
-            logger.error(f"❌ 发送到Telegram时出错: {e}")
+            logger.error(f"Telegram发送异常: {e}")
             return False
     
-    def mark_email_as_read(self, mail, email_id):
-        """标记邮件为已读"""
-        try:
-            mail.store(email_id, '+FLAGS', '\\Seen')
-            return True
-        except Exception:
+    def check_emails(self) -> bool:
+        """检查并处理邮件"""
+        imap = self.connect_imap()
+        if not imap:
             return False
-    
-    def process_unread_emails(self):
-        """处理所有未读邮件"""
-        mail = self.get_email_connection()
-        if not mail:
-            return False, 0, 0
         
         try:
             # 搜索未读邮件
-            status, messages = mail.search(None, 'UNSEEN')
+            status, messages = imap.search(None, 'UNSEEN')
             if status != "OK" or not messages[0]:
-                return True, 0, 0
+                return True
             
             email_ids = messages[0].split()
-            total_count = len(email_ids)
-            processed_count = 0
-            forwarded_count = 0
+            processed = 0
+            forwarded = 0
             
-            logger.info(f"📨 发现 {total_count} 封未读邮件")
-            
-            # 处理每封邮件
-            for email_id in email_ids:
-                email_data = self.fetch_email_content(mail, email_id)
-                if not email_data:
-                    continue
-                
-                # 判断是否处理
-                should_process, verification_code = self.should_process_email(
-                    email_data['subject'], 
-                    email_data['body']
-                )
-                
-                if should_process and verification_code:
-                    # 提取有效期信息
-                    validity_info = self.extract_validity_info(
-                        email_data['subject'], 
-                        email_data['body']
-                    )
+            # 只处理最新的5封邮件
+            for email_id in email_ids[-5:]:
+                email_info = self.process_email(imap, email_id)
+                if email_info:
+                    processed += 1
                     
-                    # 发送到Telegram
-                    self.send_to_telegram(
-                        email_data['subject'],
-                        verification_code,
-                        email_data['time'],
-                        validity_info
-                    )
-                    forwarded_count += 1
-                    logger.info(f"✅ 转发: {email_data['subject'][:60]}...")
-                else:
-                    logger.debug(f"⏭️  跳过: {email_data['subject'][:50]}...")
-                
-                # 标记为已读（无论是否转发）
-                self.mark_email_as_read(mail, email_id)
-                processed_count += 1
+                    if email_info.code:
+                        # 发送到Telegram
+                        if self.send_to_telegram(email_info):
+                            forwarded += 1
+                            logger.info(f"📤 转发验证码: {email_info.subject} -> {email_info.code}")
+                    
+                    # 标记为已读
+                    imap.store(email_id, '+FLAGS', '\\Seen')
             
-            if forwarded_count > 0:
-                logger.info(f"📊 本次转发 {forwarded_count} 封验证码邮件")
+            if forwarded > 0:
+                logger.info(f"✅ 本轮处理完成: 处理 {processed} 封，转发 {forwarded} 封")
+                EnhancedHealthHandler.metrics.emails_forwarded += forwarded
             
-            return True, processed_count, forwarded_count
+            return True
             
         except Exception as e:
-            logger.error(f"❌ 处理未读邮件时出错: {e}")
-            return False, 0, 0
+            logger.error(f"邮件检查异常: {e}")
+            return False
+        
         finally:
-            # 确保关闭连接
             try:
-                mail.close()
-                mail.logout()
+                imap.close()
+                imap.logout()
             except:
                 pass
     
     def run(self):
         """主监控循环"""
-        logger.info(f"🚀 邮箱监控服务启动")
+        logger.info("🚀 邮箱监控服务启动")
         
-        check_interval = 15  # 检查间隔（秒）
-        heartbeat_counter = 0
-        error_count = 0
+        check_interval = Config.CHECK_INTERVAL
         
         while True:
             try:
-                heartbeat_counter += 1
+                EnhancedHealthHandler.metrics.email_checks += 1
+                EnhancedHealthHandler.metrics.last_email_check = time.time()
                 
-                # 心跳日志（防WebSocket断开）
-                if heartbeat_counter % 10 == 0:
-                    logger.info(f"💓 服务运行中 | 检查次数: {heartbeat_counter} | {get_beijing_time_short()}")
-                
-                # 处理未读邮件
-                success, processed, forwarded = self.process_unread_emails()
+                # 执行检查
+                success = self.check_emails()
                 
                 if success:
-                    error_count = max(0, error_count - 1)
+                    self.error_count = max(0, self.error_count - 1)
                 else:
-                    error_count += 1
-                    logger.warning(f"⚠️ 处理失败 ({error_count}/5)")
+                    self.error_count += 1
+                    EnhancedHealthHandler.metrics.errors += 1
                 
-                # 错误过多时延长等待
-                if error_count >= 5:
-                    wait_time = 60
-                    logger.error(f"❌ 连续错误过多，等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-                    error_count = 3
-                    continue
+                # 错误处理
+                if self.error_count >= Config.MAX_ERROR_COUNT:
+                    logger.error(f"🚨 连续错误过多，等待 {Config.ERROR_BACKOFF} 秒")
+                    time.sleep(Config.ERROR_BACKOFF)
+                    self.error_count = Config.MAX_ERROR_COUNT // 2
                 
                 # 等待下次检查
                 time.sleep(check_interval)
                 
             except KeyboardInterrupt:
-                logger.info(f"👋 服务手动停止 | {get_beijing_time()}")
+                logger.info("👋 收到停止信号，优雅退出")
                 break
             except Exception as e:
-                logger.error(f"❌ 监控循环发生未预期错误: {e}")
+                logger.error(f"监控循环异常: {e}")
                 time.sleep(30)
 
-# ========== 4. 主程序入口 ==========
+# ==================== 主程序入口 ====================
+def banner():
+    """显示启动横幅"""
+    print("\n" + "=" * 60)
+    print("QQ企业邮箱 → Telegram 验证码转发服务")
+    print("版本: 1.2.0 | 专为 Koyeb 部署优化")
+    print("=" * 60)
+    print("功能特性:")
+    print("  ✓ 精准验证码识别（6种匹配模式）")
+    print("  ✓ 双重防休眠机制（内部+外部）")
+    print("  ✓ 完整健康检查接口（GET/HEAD/POST）")
+    print("  ✓ 实时监控指标和错误统计")
+    print("  ✓ 优雅的错误处理和自动恢复")
+    print("=" * 60 + "\n")
+
 def main():
-    """程序主入口"""
+    """主程序入口"""
+    banner()
     
-    # 启动健康检查服务器（防休眠）
-    health_thread = threading.Thread(target=health_server, daemon=True)
+    # 1. 验证配置
+    if not Config.validate_config():
+        logger.error("❌ 配置验证失败，程序退出")
+        sys.exit(1)
+    
+    logger.info("✅ 所有配置验证通过")
+    
+    # 2. 启动健康检查服务器（后台线程）
+    health_thread = threading.Thread(
+        target=run_health_server,
+        name="HealthServer",
+        daemon=True
+    )
     health_thread.start()
-    logger.info("✅ 健康检查服务器已启动（端口 8000）")
+    time.sleep(1)  # 给服务器启动时间
     
-    # 启动邮箱监控
+    # 3. 启动自我唤醒系统（后台线程）
+    try:
+        waker = SelfWaker()
+        wake_thread = threading.Thread(
+            target=waker.run,
+            name="SelfWaker",
+            daemon=True
+        )
+        wake_thread.start()
+        logger.info("✅ 自我唤醒系统已启动")
+    except Exception as e:
+        logger.warning(f"⚠️ 自我唤醒系统启动失败（可继续运行）: {e}")
+    
+    # 4. 启动邮箱监控（主线程）
     try:
         monitor = EmailMonitor()
         monitor.run()
-    except ValueError as e:
-        logger.error(f"❌ 配置错误: {e}")
-        logger.error("💡 请检查Koyeb环境变量: EMAIL, PASSWORD, BOT_TOKEN, CHAT_ID")
-        time.sleep(30)
+    except KeyboardInterrupt:
+        logger.info("👋 服务被用户中断")
     except Exception as e:
-        logger.error(f"❌ 服务启动失败: {e}")
-        time.sleep(30)
+        logger.error(f"💥 服务崩溃: {e}")
+        sys.exit(1)
+    
+    logger.info("服务正常停止")
 
 if __name__ == "__main__":
     main()
