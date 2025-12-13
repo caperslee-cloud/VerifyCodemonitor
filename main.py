@@ -386,7 +386,7 @@ class EmailMonitor:
                 if isinstance(match, tuple):
                     match = match[0]
                 if match.isdigit() and 4 <= len(match) <= 8:
-                      logger.debug(f"【DEBUG】正则匹配命中: 模式 '{pattern}' -> 提取内容 '{match}'")  # <-- 新增此行
+                    logger.debug(f"【DEBUG】正则匹配命中: 模式 '{pattern}' -> 提取内容 '{match}'")  # <-- 新增此行
                     return match
       
         return None
