@@ -417,8 +417,8 @@ class EmailMonitor:
         if not text:
             return None
         
-        # 截取前1000字符以提高效率
-        search_text = text[:1000]
+        # 截取前2000字符以提高效率
+        search_text = text[:2000]
         
         logger.debug(f"【DEBUG】原始文本 (前200字符): {repr(search_text[:200])}")
         
@@ -523,7 +523,7 @@ class EmailMonitor:
                 except:
                     body = str(msg.get_payload())
             
-            logger.debug(f"【DEBUG】解析到的邮件正文 (前300字符): {repr(body[:300])}")
+            logger.debug(f"【DEBUG】解析到的邮件正文 (前500字符): {repr(body[:500])}")
             
             # 提取验证码
             code = self.extract_verification_code(body)
