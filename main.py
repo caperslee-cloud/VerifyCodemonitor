@@ -380,6 +380,17 @@ class EmailMonitor:
         # 截取前1000字符以提高效率
         search_text = text[:1000]
         
+        # +++ 新增：清理HTML标签和CSS属性，防止误匹配 +++
+        # 移除HTML标签及其属性内容
+        import re
+        search_text = re.sub(r'<[^>]+>', ' ', search_text)  # 移除所有HTML标签
+        search_text = re.sub(r'\b(margin|padding|width|height|size)[: ]*\d+', ' ', search_text, flags=re.IGNORECASE)  # 移除常见CSS属性
+        search_text = re.sub(r'\d+px', ' ', search_text, flags=re.IGNORECASE)  # 移除带px单位的数字
+        search_text = re.sub(r'&#\d+;', ' ', search_text)  # 移除HTML数字实体（如 '）
+        search_text = re.sub(r'\s+', ' ', search_text)  # 将多个空格合并为一个
+        
+        logger.debug(f"【DEBUG】清理后的文本: {repr(search_text[:200])}")  # 可选：查看清理效果
+        
         for pattern in Config.CODE_PATTERNS:
             matches = re.findall(pattern, search_text, re.IGNORECASE)
             for match in matches:
