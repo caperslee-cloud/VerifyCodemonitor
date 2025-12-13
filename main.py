@@ -492,12 +492,10 @@ class EmailMonitor:
                 "📨 *验证码通知*",
                 "──────────────",
                 f"*📌 标题*: {email_info.subject}",
-                f"*👤 发件人*: {email_info.sender[:50]}",
                 f"*🕒 时间*: {email_info.date} (检测于 {current_time})",
                 "",
                 f"*🔐 验证码*: `{email_info.code}`",
                 "──────────────",
-                f"_自动转发服务 | {HealthMetrics.get_beijing_time()}_"
             ]
             
             message = "\n".join(message_lines)
