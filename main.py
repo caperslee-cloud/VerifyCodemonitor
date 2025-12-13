@@ -36,7 +36,7 @@ class FixedEmailMonitor:
         self.chat_id = os.environ.get("CHAT_ID", "").strip()
         
         # 邮箱服务器配置
-        self.imap_server = "imap.163.com"
+        self.imap_server = "imap.exmail.qq.com"
         self.imap_port = 993
         
         # 检查间隔（秒）
