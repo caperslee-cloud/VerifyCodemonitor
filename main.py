@@ -594,8 +594,9 @@ class EmailMonitor:
                 f"*📌 标题*: {email_info.subject}",
                 "",
                 f"*🕒 时间*: {email_info.date} (7分钟内使用)",
-            ]
                 "",
+            ]
+            
             # 如果有银行卡后4位，则添加一行
             if email_info.card_last_four:
                 message_lines.append(f"*💳 卡号后四位*: `{email_info.card_last_four}`")
