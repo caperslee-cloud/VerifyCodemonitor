@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-QQ企业邮箱 → Telegram 验证码转发服务 (完整优化版)
-版本: 1.4.0 | 专为 Koyeb 部署优化
+QQ企业邮箱 → Telegram 验证码转发服务 (最终修复版)
+版本: 1.4.1 | 专为 Koyeb 部署优化
 功能: 1.精准验证码识别 2.银行卡号提取 3.双重防休眠 4.完整监控
 """
 
@@ -133,7 +133,7 @@ def setup_logging():
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter(
             '[%(asctime)s] %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            datefmt='%Y-%m-d %H:%M:%S'
         )
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
@@ -188,7 +188,7 @@ class HealthMetrics:
             "last_email_check": self.format_time(self.last_email_check),
             "last_telegram_send": self.format_time(self.last_telegram_send),
             "current_time": self.get_beijing_time(),
-            "version": "1.4.0"
+            "version": "1.4.1"
         }
     
     @staticmethod
@@ -448,25 +448,16 @@ class EmailMonitor:
         return None
     
     def extract_card_last_four(self, text: str) -> Optional[str]:
-        """提取银行卡号后4位（支持多种掩码格式）"""
+        """提取银行卡号后4位（支持多种掩码格式）- 修复版"""
         if not text:
             return None
         
-        # 策略：在验证码出现之前查找银行卡号
-        # 先找到验证码的位置
-        code_match = re.search(r'(?:验证码|验证代码|Code|CODE)[：:\s]*(\d{4,8})', text)
-        if code_match:
-            # 只查找验证码前面的文本
-            text_before_code = text[:code_match.start()]
-        else:
-            text_before_code = text[:500]  # 如果没有验证码，只搜索前500字符
-        
         # 银行卡号模式（按优先级排序）
         patterns = [
-            # 1. 掩码分隔格式：XXXX-XXxx-xxxx-XXXX
+            # 1. 掩码分隔格式：XXXX-XXxx-xxxx-XXXX (如：4931-93xx-xxxx-6206)
             r'\b\d{4}[- ][\dXx]{2,4}[- ][\dXx]{2,4}[- ](\d{4})\b',
             
-            # 2. 连续掩码格式：XXXXXXXXxxxxxxXXXX
+            # 2. 连续掩码格式：XXXXXXXXxxxxxxXXXX (如：49387519xxxxxx5392)
             r'\b\d{8,12}[Xx]{4,8}(\d{4})\b',
             
             # 3. 通用分隔格式：XXXX XXXX XXXX XXXX
@@ -476,10 +467,19 @@ class EmailMonitor:
             r'(?:尾号|后四位|末四位)[:：\s]*(\d{4})',
         ]
         
+        # 策略1：首先在整个文本中搜索（提高成功率）
         for pattern in patterns:
-            match = re.search(pattern, text_before_code, re.IGNORECASE)
+            match = re.search(pattern, text, re.IGNORECASE)
             if match and match.group(1):
-                logger.debug(f"🔍 银行卡匹配命中: 模式 '{pattern}' -> 提取 '{match.group(1)}'")
+                logger.debug(f"🔍 银行卡匹配命中(全文本): 模式 '{pattern}' -> 提取 '{match.group(1)}'")
+                return match.group(1)
+        
+        # 策略2：如果没找到，尝试清理HTML后查找
+        cleaned_text = self._clean_html_text(text[:1000])
+        for pattern in patterns:
+            match = re.search(pattern, cleaned_text, re.IGNORECASE)
+            if match and match.group(1):
+                logger.debug(f"🔍 银行卡匹配命中(清理后): 模式 '{pattern}' -> 提取 '{match.group(1)}'")
                 return match.group(1)
         
         return None
@@ -592,9 +592,7 @@ class EmailMonitor:
                 "📨 *验证码通知*",
                 "──────────────",
                 f"*📌 标题*: {email_info.subject}",
-                "",
                 f"*🕒 时间*: {email_info.date} (7分钟内使用)",
-                "",
             ]
             
             # 如果有银行卡后4位，则添加一行
@@ -730,7 +728,7 @@ def banner():
     """显示启动横幅"""
     print("\n" + "=" * 60)
     print("QQ企业邮箱 → Telegram 验证码转发服务")
-    print("版本: 1.4.0 | 专为 Koyeb 部署优化")
+    print("版本: 1.4.1 | 专为 Koyeb 部署优化")
     print("=" * 60)
     print("功能特性:")
     print("  ✓ 精准验证码识别（支持中英文HTML邮件）")
