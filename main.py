@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-QQ企业邮箱 → Telegram 验证码转发 (专业生产版)
-功能：1.精准验证码识别 2.双重防休眠机制 3.完整监控指标 4.优雅错误处理
-部署于Koyeb时，配置环境变量即可使用
+QQ企业邮箱 → Telegram 验证码转发服务 (完整优化版)
+版本: 1.4.0 | 专为 Koyeb 部署优化
+功能: 1.精准验证码识别 2.银行卡号提取 3.双重防休眠 4.完整监控
 """
 
 import os
@@ -56,7 +56,7 @@ class Config:
         
         # 规则2: 匹配在"验证码"文本后，且被<div>包裹的6位数字
         r'验证码[^<]*</p>\s*<div[^>]*>\s*(\d{6})\s*</div>',
-
+        
         # ==== 通用中英文规则 ====
         # 规则3: 匹配"验证码/Code"标签后的数字
         r'(?:验证码|验证代码|Code|CODE)[：:\s]*(\d{4,8})',
@@ -121,11 +121,11 @@ class ColoredFormatter(logging.Formatter):
 def setup_logging():
     """配置日志系统"""
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)  # 生产环境建议用 INFO，调试时改为 DEBUG
     
     # 控制台处理器
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     
     # 文件处理器（可选）
     if os.path.exists("/tmp"):
@@ -159,6 +159,7 @@ class EmailInfo:
     date: str
     code: Optional[str] = None
     raw_body: str = ""
+    card_last_four: Optional[str] = None  # 银行卡后4位
 
 @dataclass
 class HealthMetrics:
@@ -187,7 +188,7 @@ class HealthMetrics:
             "last_email_check": self.format_time(self.last_email_check),
             "last_telegram_send": self.format_time(self.last_telegram_send),
             "current_time": self.get_beijing_time(),
-            "version": "1.2.0"
+            "version": "1.4.0"
         }
     
     @staticmethod
@@ -208,7 +209,7 @@ class HealthMetrics:
 class EnhancedHealthHandler(BaseHTTPRequestHandler):
     """增强型健康检查处理器"""
     
-    server_version = "EmailMonitor/1.2"
+    server_version = "EmailMonitor/1.4"
     metrics = HealthMetrics(start_time=time.time())
     
     def log_message(self, format: str, *args):
@@ -417,7 +418,7 @@ class EmailMonitor:
         if not text:
             return None
         
-        # 截取前2000字符以提高效率
+        # 截取足够长的字符以确保包含验证码
         search_text = text[:2000]
         
         logger.debug(f"【DEBUG】原始文本 (前200字符): {repr(search_text[:200])}")
@@ -443,6 +444,43 @@ class EmailMonitor:
                 if code.isdigit() and 4 <= len(code) <= 8:
                     logger.debug(f"【DEBUG】通用规则匹配命中: 模式 '{pattern}' -> 提取内容 '{code}'")
                     return code
+        
+        return None
+    
+    def extract_card_last_four(self, text: str) -> Optional[str]:
+        """提取银行卡号后4位（支持多种掩码格式）"""
+        if not text:
+            return None
+        
+        # 策略：在验证码出现之前查找银行卡号
+        # 先找到验证码的位置
+        code_match = re.search(r'(?:验证码|验证代码|Code|CODE)[：:\s]*(\d{4,8})', text)
+        if code_match:
+            # 只查找验证码前面的文本
+            text_before_code = text[:code_match.start()]
+        else:
+            text_before_code = text[:500]  # 如果没有验证码，只搜索前500字符
+        
+        # 银行卡号模式（按优先级排序）
+        patterns = [
+            # 1. 掩码分隔格式：XXXX-XXxx-xxxx-XXXX
+            r'\b\d{4}[- ][\dXx]{2,4}[- ][\dXx]{2,4}[- ](\d{4})\b',
+            
+            # 2. 连续掩码格式：XXXXXXXXxxxxxxXXXX
+            r'\b\d{8,12}[Xx]{4,8}(\d{4})\b',
+            
+            # 3. 通用分隔格式：XXXX XXXX XXXX XXXX
+            r'\b\d{4}[- ]\d{4}[- ]\d{4}[- ](\d{4})\b',
+            
+            # 4. 简单尾号提示："尾号XXXX"或"后四位XXXX"
+            r'(?:尾号|后四位|末四位)[:：\s]*(\d{4})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_before_code, re.IGNORECASE)
+            if match and match.group(1):
+                logger.debug(f"🔍 银行卡匹配命中: 模式 '{pattern}' -> 提取 '{match.group(1)}'")
+                return match.group(1)
         
         return None
     
@@ -528,12 +566,16 @@ class EmailMonitor:
             # 提取验证码
             code = self.extract_verification_code(body)
             
+            # 提取银行卡后4位
+            card_last_four = self.extract_card_last_four(body)
+            
             return EmailInfo(
                 subject=subject,
                 sender=sender,
                 date=date_formatted,
                 code=code,
-                raw_body=body[:500]  # 只保存前500字符
+                raw_body=body[:500],
+                card_last_four=card_last_four
             )
             
         except Exception as e:
@@ -541,7 +583,7 @@ class EmailMonitor:
             return None
     
     def send_to_telegram(self, email_info: EmailInfo) -> bool:
-        """发送到Telegram"""
+        """发送到Telegram（包含银行卡信息）"""
         try:
             current_time = datetime.now(Config.BEIJING_TZ).strftime('%H:%M:%S')
             
@@ -552,10 +594,18 @@ class EmailMonitor:
                 f"*📌 标题*: {email_info.subject}",
                 "",
                 f"*🕒 时间*: {email_info.date} (7分钟内使用)",
+            ]
+                "",
+            # 如果有银行卡后4位，则添加一行
+            if email_info.card_last_four:
+                message_lines.append(f"*💳 卡号后四位*: `{email_info.card_last_four}`")
+            
+            # 继续原有格式
+            message_lines.extend([
                 "",
                 f"*🔐 验证码*: `{email_info.code}`",
                 "──────────────",
-            ]
+            ])
             
             message = "\n".join(message_lines)
             
@@ -679,11 +729,12 @@ def banner():
     """显示启动横幅"""
     print("\n" + "=" * 60)
     print("QQ企业邮箱 → Telegram 验证码转发服务")
-    print("版本: 1.3.0 | 专为 Koyeb 部署优化")
+    print("版本: 1.4.0 | 专为 Koyeb 部署优化")
     print("=" * 60)
     print("功能特性:")
     print("  ✓ 精准验证码识别（支持中英文HTML邮件）")
-    print("  ✓ 双重防休眠机制（内部+外部）")
+    print("  ✓ 银行卡号后4位提取（支持多种掩码格式）")
+    print("  ✓ 双重防休眠机制（内部+外部保活）")
     print("  ✓ 完整健康检查接口（GET/HEAD/POST）")
     print("  ✓ 实时监控指标和错误统计")
     print("  ✓ 优雅的错误处理和自动恢复")
